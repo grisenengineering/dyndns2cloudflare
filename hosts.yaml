@@ -1,0 +1,16 @@
+# Example hosts.yaml-file
+---
+- host:
+  hostname: test3.example.com
+  username: user1
+  password: password1
+
+- host:
+  hostname: test4.example.com
+  username: user2
+  password: password2
+
+- host:
+  hostname: test5.example.com
+  username: user3
+  password_hash: 5906AC361A137E2D286465CD6588EBB5AC3F5AE955001100BC41577C3D751764
