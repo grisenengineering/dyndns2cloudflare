@@ -2,6 +2,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 from base64 import b64decode
 from hashlib import sha256
+from enum import Enum
 import time
 import datetime
 import yaml
@@ -11,6 +12,11 @@ import CloudFlare
 
 _yamlFileName = '/config/hosts.yaml'
 _serverPort = 8080
+
+class cfStatus(Enum):
+    NOHOST = 0
+    UPDATED = 1
+    NOCHG = 2
 
 class DDNSHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -25,7 +31,7 @@ class DDNSHandler(BaseHTTPRequestHandler):
             self.wfile.write(bytes("%s" % self.getOriginalClientIP(), "utf-8"))
         
         
-        if(self.path.startswith('/?')):
+        if(self.path.startswith('/nic/update?')):
             # DynDns2-messages consists of a GET-request formated as http://[server-fqdn]/?hostname=example.com&ip=0.0.0.0
             # username and password is sent as basic HTTP authentication
 
@@ -50,6 +56,7 @@ class DDNSHandler(BaseHTTPRequestHandler):
             if(not parsedQuery.get('hostname')):
                 self.send_response(400)
                 self.end_headers()
+                self.wfile.write(bytes("nohost", "utf-8"))
                 return
 
             clientHostName = parsedQuery.get('hostname')[0]
@@ -58,21 +65,38 @@ class DDNSHandler(BaseHTTPRequestHandler):
             if(not parsedQuery.get('myip')):
                 self.send_response(400)
                 self.end_headers()
+                self.wfile.write(bytes("nohost", "utf-8"))
                 return
             
             clientMyIP = parsedQuery.get('myip')[0]
             
             if(verifyDDNSRequest(clientUserName, clientPassword, clientHostName, clientMyIP, self.getOriginalClientIP())):
-                # Verification of request succeded, send a 200 OK
-                self.send_response(200)
-                self.end_headers()
+                
                 # Set the DNS-record for the host
                 print(f"[{datetime.datetime.now()}] Valid DDNS request from {clientHostName}, requested IP: {clientMyIP}")
-                setDNS(clientHostName, clientMyIP)
+                response = setDNS(clientHostName, clientMyIP)
+                if(response == cfStatus.NOHOST):
+                    # No host found in cloudflare of wrong domain, return error
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(bytes("nohost", "utf-8"))
+                    return
+                if(response == cfStatus.NOCHG):
+                    # Host was found but already pointing to this adress, return status message
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(bytes("nochg", "utf-8"))
+                    return
+                
+                # Host was found and update succeded, just respond witth 200 ok
+                self.send_response(200)
+                self.end_headers()
+
             else:
                 # The verification for the request failed so return 403
                 self.send_response(403)
                 self.end_headers()
+                self.wfile.write(bytes("badauth", "utf-8"))
 
 
     def getOriginalClientIP(self):
@@ -143,15 +167,18 @@ def setDNS(clientHostName, clientIP):
         domainName = clientHostName.split('.',1)[1]
     except:
         print (f"[{datetime.datetime.now()}] WARNING: DNS-name not correctly formated. Nothing changed")
-        return
+        return cfStatus.NOHOST
 
     # Get zone ID for the domain or return if it does not exist
-    zones = cf.zones.get(params={'name': domainName})
-    if len(zones) == 0:
-        print(f"[{datetime.datetime.now()}] WARNING: The CloudFlare-account does not have a zone for: {domainName}. Nothing changed")
-        return
+    zones = cf.zones.get()
+    zone_id = None
+    for zone in zones:
+        if clientHostName.endswith(zone['name']):
+            zone_id = zone['id']
 
-    zone_id = zones[0]['id']
+    if (not zone_id):
+        print(f"[{datetime.datetime.now()}] WARNING: The CloudFlare-account does not have a zone for: {domainName}. Nothing changed")
+        return cfStatus.NOHOST
 
     # Check if the record exists in the zone
     dns_records = cf.zones.dns_records.get(zone_id, params={'name': clientHostName})
@@ -168,17 +195,20 @@ def setDNS(clientHostName, clientIP):
 
         cf.zones.dns_records.post(zone_id, data=record)
         print(f"[{datetime.datetime.now()}] New DNS record created for {clientHostName} with IP address {clientIP}")
+        cfStatus.UPDATED
     else:
         # Update existing DNS record
         record = dns_records[0]
         # Check if new IP matches the old IP
         if (record['content'] == clientIP):
             print(f"[{datetime.datetime.now()}] DNS record for {clientHostName} already points to {clientIP}, Nothing changed")
+            return cfStatus.NOCHG
         else:
             # Change the IP-address for the record
             record['content'] = clientIP
             cf.zones.dns_records.put(zone_id, record['id'], data=record)
             print(f"[{datetime.datetime.now()}] DNS record for {clientHostName} updated with IP address {clientIP}")
+            return cfStatus.UPDATED
 
 
 def main():
